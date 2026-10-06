@@ -22,14 +22,17 @@ from .segmenter import Segmenter
 ENTITY_TYPE_NAMES = {
     "PERSON": "人名", "LOCATION": "地名", "ORGANIZATION": "机构",
     "TIME": "时间", "DATE": "日期", "NUMBER": "数字", "MONEY": "金额",
-    "PERCENT": "百分比",
+    "PERCENT": "百分比", "PRODUCT": "产品", "CATEGORY": "品类",
+    "TITLE": "职位", "EVENT": "事件",
 }
 
 
 # 正则规则：按优先级排列
 _REGEX_RULES = [
     ("DATE", re.compile(r"\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2}日?")),
-    ("DATE", re.compile(r"\d{1,2}月\d{1,2}日")),
+    ("DATE", re.compile(r"\d{4}[年/\-]\d{1,2}月")),
+    ("DATE", re.compile(r"\d{4}年(?:\d{1,2}月)?")),
+    ("DATE", re.compile(r"\d{1,2}月\d{1,2}日?")),
     ("TIME", re.compile(r"\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")),
     ("MONEY", re.compile(r"\d+(?:\.\d+)?(?:万元|亿元|人民币|美元|港元|港币|欧元|日元|英镑|元)")),
     ("PERCENT", re.compile(r"百分之[零一二三四五六七八九十百]+|\d+(?:\.\d+)?%")),
@@ -81,6 +84,14 @@ class NERExtractor:
         # 3. 结构规则（姓氏+名 / 后缀）
         rule_entities = self._rule_match(text)
         for ent in rule_entities:
+            span = (ent["start"], ent["end"])
+            if self._overlaps(span, consumed):
+                continue
+            consumed.append(span)
+            entities.append(ent)
+
+        # 4. 未登录中文人名（弥补分词器把人名拆开的情况）
+        for ent in self._person_regex_match(text):
             span = (ent["start"], ent["end"])
             if self._overlaps(span, consumed):
                 continue
@@ -155,6 +166,22 @@ class NERExtractor:
                 results.append({"start": start, "end": end,
                                 "text": word, "type": "PERSON"})
 
+        return results
+
+    def _person_regex_match(self, text: str) -> list[dict]:
+        given = "".join(sorted(GIVEN_NAME_CHARS | set("三四五六七八九十")))
+        pattern = re.compile(rf"[一-鿿][{given}]{{1,2}}")
+        results = []
+        for m in pattern.finditer(text):
+            name = m.group()
+            if name[0] not in SURNAMES or len(name) < 2:
+                continue
+            # 避免把“张先生”等称谓当成人名
+            if name.endswith(("先生", "女士", "小姐", "同志", "老师",
+                              "教授", "博士", "经理", "局长", "主席", "书记")):
+                continue
+            results.append({"start": m.start(), "end": m.end(),
+                            "text": name, "type": "PERSON"})
         return results
 
     # -- 工具 -------------------------------------------------------------

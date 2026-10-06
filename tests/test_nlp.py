@@ -19,10 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
-                 get_keywords, get_embeddings, TAGSET)
+                 get_keywords, get_embeddings, get_relation_extractor, TAGSET)
 from nlp.hmm import HMM
 from pipeline import PipelineEngine, PipelineError
-from storage import ShardedStore, StoreRegistry
+from storage import ShardedStore, StoreRegistry, KnowledgeGraphStore
 
 
 class TestSegmenter(unittest.TestCase):
@@ -90,6 +90,106 @@ class TestNER(unittest.TestCase):
         texts = [e["text"] for e in ents]
         self.assertTrue(any("2024" in t for t in texts))
         self.assertTrue(any("99.9" in t for t in texts))
+
+
+class TestRelations(unittest.TestCase):
+    def test_employment_and_title(self):
+        result = get_relation_extractor().extract(
+            "张三在2024年5月加入字节跳动，担任算法工程师。")
+        triples = {(r["source"]["text"], r["relation"], r["target"]["text"])
+                   for r in result["relations"]}
+        self.assertIn(("张三", "WORKS_AT", "字节跳动"), triples)
+        self.assertIn(("张三", "SERVED_AS", "算法工程师"), triples)
+        works = next(r for r in result["relations"] if r["relation"] == "WORKS_AT")
+        self.assertEqual(works["qualifiers"]["time"]["text"], "2024年5月")
+        self.assertEqual(works["evidence"]["sentence"][:2], "张三")
+
+    def test_product_category_price(self):
+        result = get_relation_extractor().extract(
+            "华为在2023年8月发布了Mate 60 Pro手机，Mate 60 Pro属于智能手机品类，售价5999元。")
+        triples = {(r["source"]["text"], r["relation"], r["target"]["text"])
+                   for r in result["relations"]}
+        self.assertIn(("华为", "LAUNCHES", "Mate 60 Pro"), triples)
+        self.assertIn(("Mate 60 Pro", "BELONGS_TO", "智能手机品类"), triples)
+        self.assertIn(("Mate 60 Pro", "PRICED_AT", "5999元"), triples)
+
+    def test_actor_is_not_guessed_across_clause(self):
+        result = get_relation_extractor().extract(
+            "马云在北京的阿里巴巴公司工作，2024年10月1日发布了新产品。")
+        triples = {(r["source"]["text"], r["relation"], r["target"]["text"])
+                   for r in result["relations"]}
+        self.assertIn(("马云", "WORKS_AT", "阿里巴巴"), triples)
+        self.assertFalse(any(r["target"]["text"] == "发布了新产品"
+                             for r in result["relations"]))
+
+    def test_generic_event_has_time_and_direction(self):
+        result = get_relation_extractor().extract("华为在2023年8月发布了新产品。")
+        event_edge = next(r for r in result["relations"]
+                          if r["relation"] == "PERFORMED")
+        self.assertEqual(event_edge["source"]["type"], "ORGANIZATION")
+        self.assertEqual(event_edge["target"]["type"], "EVENT")
+        self.assertEqual(event_edge["qualifiers"]["time"]["text"], "2023年8月")
+        self.assertTrue(any(r["relation"] == "OCCURRED_AT"
+                            for r in result["relations"]))
+
+    def test_no_relation_is_fabricated(self):
+        result = get_relation_extractor().extract(
+            "今天的天气和北京的交通都很普通。")
+        self.assertEqual([], result["relations"])
+
+
+class TestKnowledgeGraph(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.kg = KnowledgeGraphStore(StoreRegistry(self.tmp, shard_size=10))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cross_document_merge_and_evidence(self):
+        text_a = "张三在2024年5月加入字节跳动。"
+        text_b = "张三在2025年1月加入字节跳动。"
+        self.kg.ingest_text(text_a, doc_id="a", name="A")
+        self.kg.ingest_text(text_b, doc_id="b", name="B")
+        graph = self.kg.graph()
+        self.assertEqual(graph["stats"]["documents"], 2)
+        edge = next(e for e in graph["edges"] if e["relation"] == "WORKS_AT")
+        self.assertEqual(edge["doc_count"], 2)
+        self.assertEqual(edge["mention_count"], 2)
+        self.assertEqual(len(edge["qualifiers"]["all_times"]), 2)
+        detail = self.kg.node_detail(edge["source_id"])
+        self.assertTrue(any("张三" in m["sentence"] for m in detail["mentions"]))
+
+    def test_reingest_is_idempotent(self):
+        text = "华为发布了Mate 60 Pro手机，Mate 60 Pro属于智能手机品类。"
+        self.kg.ingest_text(text, doc_id="d")
+        first = self.kg.stats()
+        self.kg.ingest_text(text, doc_id="d")
+        self.assertEqual(first, self.kg.stats())
+
+    def test_alias_rebuild(self):
+        self.kg.ingest_text("阿里巴巴公司发布了新产品。", doc_id="a")
+        node = next(n for n in self.kg.nodes.all()
+                    if n["type"] == "ORGANIZATION" and n["canonical"] == "阿里巴巴")
+        # 规范名已自动去掉公司后缀，因此两篇文档应对到同一节点。
+        self.kg.ingest_text("阿里巴巴发布了另一个产品。", doc_id="b")
+        self.assertEqual(node["id"], next(
+            n["id"] for n in self.kg.nodes.all()
+            if n["type"] == "ORGANIZATION" and n["canonical"] == "阿里巴巴"))
+
+    def test_explicit_alias_aligns_documents(self):
+        self.kg.ingest_text("阿里巴巴公司发布了新产品。", doc_id="a")
+        node = next(n for n in self.kg.nodes.all()
+                    if n["type"] == "ORGANIZATION" and n["canonical"] == "阿里巴巴")
+        self.kg.add_alias(node["id"], "阿里")
+        self.kg.ingest_text("阿里发布了新产品。", doc_id="b")
+        self.kg.rebuild()
+        merged = self.kg.nodes.get(node["id"])
+        self.assertEqual(merged["doc_count"], 2)
+        self.assertIn("阿里", merged["aliases"])
+        org_count = sum(1 for n in self.kg.nodes.all()
+                        if not n.get("_deleted") and n["type"] == "ORGANIZATION")
+        self.assertEqual(org_count, 1)
 
 
 class TestSentiment(unittest.TestCase):
@@ -220,6 +320,13 @@ class TestPipeline(unittest.TestCase):
         self.assertIn("words", out)
         self.assertIn("pos", out)
         self.assertIn("sentiment", out)
+
+        cfg = {"name": "p", "stages": [
+            {"name": "segment"}, {"name": "ner"}, {"name": "knowledge_graph"}]}
+        out = self.engine.build(cfg).run(
+            {"text": "张三在2024年5月加入字节跳动。"})
+        self.assertIn("knowledge_graph", out)
+        self.assertTrue(out["knowledge_graph"]["relations"])
 
     def test_batch(self):
         cfg = {"name": "p", "stages": [{"name": "segment"}, {"name": "keywords"}]}

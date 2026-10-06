@@ -272,6 +272,74 @@ class ShardedStore:
                             return True
         return False
 
+    def upsert(self, record: dict) -> tuple[str, bool]:
+        """按 ``id`` 插入或更新记录，返回 ``(id, created)``。
+
+        更新只替换已有的活跃记录，不改变其分片位置和创建时间。
+        """
+        if not isinstance(record, dict):
+            raise TypeError("record 必须是 dict")
+        if not record.get("id"):
+            return self.insert(record), True
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            record_id = record["id"]
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, old in enumerate(records):
+                        if old.get("id") == record_id and not old.get("_deleted"):
+                            merged = dict(record)
+                            merged["id"] = record_id
+                            merged["_created"] = old.get("_created", time.time())
+                            records[i] = merged
+                            self._write_shard(index, records)
+                            return record_id, False
+        return self.insert(record), True
+
+    def delete_many(self, record_ids: Iterable[str]) -> int:
+        """批量删除多个 id，返回删除数量。"""
+        ids = set(record_ids)
+        if not ids:
+            return 0
+        removed = 0
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                changed = False
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") in ids and not record.get("_deleted"):
+                            records[i] = {"id": record["id"], "_deleted": True}
+                            changed = True
+                            removed += 1
+                    if changed:
+                        self._write_shard(index, records)
+            if removed:
+                meta["total"] -= removed
+                self._write_meta(meta)
+        return removed
+
+    def clear(self) -> int:
+        """删除全部分片中的记录并重置计数。"""
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            old_count = meta.get("shard_count", 0)
+            removed = 0
+            for index in range(old_count):
+                records = self._read_shard(index)
+                removed += sum(1 for r in records if not r.get("_deleted"))
+                try:
+                    os.remove(self._shard_path(index))
+                except FileNotFoundError:
+                    pass
+            meta.update({"shard_count": 0, "total": 0, "next_id": 1})
+            self._write_meta(meta)
+            return removed
+
     # -- 合并 / 压缩 ------------------------------------------------------
     def compact(self) -> dict:
         """把所有存活记录重新写入尽可能少的分片，并清理墓碑。

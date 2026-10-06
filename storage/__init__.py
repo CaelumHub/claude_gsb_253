@@ -2,6 +2,7 @@
 
 from .lock import FileLock, LockTimeout, lock_path_for
 from .sharded import ShardedStore, StoreRegistry, _atomic_write_json, _read_json
+from .knowledge_graph import KnowledgeGraphStore
 
 __all__ = [
     "FileLock",
@@ -9,6 +10,7 @@ __all__ = [
     "lock_path_for",
     "ShardedStore",
     "StoreRegistry",
+    "KnowledgeGraphStore",
     "_atomic_write_json",
     "_read_json",
 ]

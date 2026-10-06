@@ -7,6 +7,7 @@ const PAGES = [
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
+  { file: "kg.html",        name: "实体关系图谱", desc: "关系抽取 / 图谱" },
   { file: "sentiment.html", name: "情感分析",     desc: "正负面分类" },
   { file: "summary.html",   name: "文本摘要",     desc: "抽取式摘要" },
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },
@@ -17,7 +18,7 @@ const PAGES = [
 
 const PAGE_NAMES = {
   corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
-  ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
+  ner: "命名实体识别", kg: "实体关系图谱", sentiment: "情感分析", summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
   pipeline: "流水线配置与执行",
 };
@@ -32,6 +33,13 @@ const TAG_NAMES = {
 const ENTITY_NAMES = {
   PERSON: "人名", LOCATION: "地名", ORGANIZATION: "机构", TIME: "时间",
   DATE: "日期", NUMBER: "数字", MONEY: "金额", PERCENT: "百分比",
+  PRODUCT: "产品", CATEGORY: "品类", TITLE: "职位", EVENT: "事件",
+};
+
+const RELATION_NAMES = {
+  WORKS_AT: "任职于", FOUNDED: "创办", SERVED_AS: "担任", LOCATED_IN: "位于",
+  PRODUCES: "生产", LAUNCHES: "发布", BELONGS_TO: "属于品类", PRICED_AT: "价格为",
+  PERFORMED: "参与事件", OCCURRED_AT: "发生于",
 };
 
 const DEP_REL_NAMES = {

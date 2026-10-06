@@ -15,11 +15,12 @@ from typing import Optional
 from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
-                 get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_parser, get_relation_extractor, get_segmenter,
+                 get_sentiment, get_summarizer, get_tagger, get_translator,
+                 ENTITY_TYPE_NAMES, TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES,
+                 POLARITY_NAMES, RELATION_NAMES)
 from nlp.lexicon import STOPWORDS
-from storage import StoreRegistry
+from storage import KnowledgeGraphStore, StoreRegistry
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -35,6 +36,12 @@ def _registry() -> StoreRegistry:
 
 def _engine():
     return current_app.config["PIPELINE_ENGINE"]
+
+
+def _kg() -> KnowledgeGraphStore:
+    if "KNOWLEDGE_GRAPH" not in current_app.config:
+        current_app.config["KNOWLEDGE_GRAPH"] = KnowledgeGraphStore(_registry())
+    return current_app.config["KNOWLEDGE_GRAPH"]
 
 
 def _models_dir() -> str:
@@ -110,6 +117,7 @@ def meta():
         "dep_rel_names": DEP_REL_NAMES,
         "phrase_names": PHRASE_NAMES,
         "entity_type_names": ENTITY_TYPE_NAMES,
+        "relation_names": RELATION_NAMES,
         "polarity_names": POLARITY_NAMES,
         "directions": [{"id": "zh2en", "name": "中文 → 英文"},
                        {"id": "en2zh", "name": "英文 → 中文"}],
@@ -287,6 +295,124 @@ def ner_annotate():
 def ner_annotations():
     records = _registry().task("annotation").all()
     return jsonify({"annotations": records})
+
+
+# ---------------------------------------------------------------------------
+# 实体关系抽取与知识图谱
+# ---------------------------------------------------------------------------
+
+@api.post("/relations")
+def extract_relations():
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    result = get_relation_extractor().extract(text)
+    rid = _store_result("relation", text, result, corpus_id=cid)
+    result["id"] = rid
+    return jsonify(result)
+
+
+@api.post("/kg/ingest")
+def kg_ingest():
+    data = _payload()
+    corpus_id = data.get("corpus_id")
+    if corpus_id:
+        record = _registry().task("corpus").get(corpus_id)
+        if not record:
+            return jsonify({"error": "语料不存在"}), 404
+        try:
+            result = _kg().ingest_text(
+                record.get("text", ""), doc_id=corpus_id,
+                name=record.get("name", ""), corpus_id=corpus_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
+    corpus_ids = data.get("corpus_ids") or []
+    if corpus_ids:
+        store = _registry().task("corpus")
+        totals = {"nodes": 0, "relations": 0, "mentions": 0, "documents": 0}
+        for cid_value in corpus_ids:
+            record = store.get(cid_value)
+            if not record:
+                continue
+            r = _kg().ingest_text(record["text"], doc_id=cid_value,
+                                  name=record.get("name", ""),
+                                  corpus_id=cid_value)
+            totals["nodes"] += r["nodes"]
+            totals["relations"] += r["relations"]
+            totals["mentions"] += r["mentions"]
+            totals["documents"] += 1
+        totals["doc_id"] = None
+        return jsonify(totals)
+
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "缺少文本或语料 ID"}), 400
+    try:
+        result = _kg().ingest_text(
+            text, doc_id=data.get("doc_id"), name=data.get("name", ""),
+            metadata={"source": data.get("source", "manual")})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
+@api.get("/kg")
+def kg_graph():
+    return jsonify(_kg().graph(
+        limit_nodes=request.args.get("node_limit", default=300, type=int),
+        limit_edges=request.args.get("edge_limit", default=600, type=int),
+        node_type=request.args.get("type") or None,
+        relation=request.args.get("relation") or None,
+        query=request.args.get("q") or None))
+
+
+@api.get("/kg/nodes/<node_id>")
+def kg_node(node_id: str):
+    detail = _kg().node_detail(node_id)
+    if not detail:
+        return jsonify({"error": "节点不存在"}), 404
+    return jsonify(detail)
+
+
+@api.get("/kg/edges/<edge_id>")
+def kg_edge(edge_id: str):
+    detail = _kg().edge_detail(edge_id)
+    if not detail:
+        return jsonify({"error": "关系不存在"}), 404
+    return jsonify(detail)
+
+
+@api.get("/kg/stats")
+def kg_stats():
+    return jsonify(_kg().stats())
+
+
+@api.delete("/kg/documents/<doc_id>")
+def kg_delete_document(doc_id: str):
+    return jsonify({"ok": _kg().delete_document(doc_id)})
+
+
+@api.post("/kg/rebuild")
+def kg_rebuild():
+    return jsonify(_kg().rebuild())
+
+
+@api.post("/kg/nodes/<node_id>/alias")
+def kg_add_alias(node_id: str):
+    data = _payload()
+    alias = (data.get("alias") or "").strip()
+    try:
+        return jsonify(_kg().add_alias(node_id, alias))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@api.post("/kg/compact")
+def kg_compact():
+    return jsonify(_kg().compact())
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +701,7 @@ def list_result_tasks():
     registry = _registry()
     tasks = []
     for name in registry.tasks():
-        if name in ("corpus", "pipeline_config", "annotation"):
+        if name in ("corpus", "pipeline_config", "annotation") or name.startswith("kg_"):
             continue
         stats = registry.task(name).stats()
         tasks.append(stats)

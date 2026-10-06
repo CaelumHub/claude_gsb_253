@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实体关系图谱 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">实体关系图谱</h1>
+    <p class="page-desc">同句抽取有向关系，跨文档按“类型 + 规范名”合并节点；每条边保留原文证据，未命中强模式时不硬造关系。</p>
+
+    <section class="card">
+      <label>输入文本</label>
+      <textarea id="text">马云在北京的阿里巴巴公司工作。张三在2024年5月加入字节跳动，担任算法工程师。华为在2023年8月发布了Mate 60 Pro手机，Mate 60 Pro属于智能手机品类，售价5999元。特斯拉生产Model Y，Model Y是一款电动汽车。</textarea>
+      <div class="toolbar mt">
+        <button class="btn" id="btn-preview">只预览抽取</button>
+        <button class="btn secondary" id="btn-ingest">导入并合并到图谱</button>
+        <span class="muted small">导入是幂等的：重复导入同一文本会先清除旧证据再刷新计数。</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">跨文档导入</h2>
+        <button class="btn secondary small" id="btn-load-corpora">刷新语料</button>
+        <button class="btn small" id="btn-ingest-selected">导入选中语料</button>
+        <button class="btn secondary small" id="btn-ingest-all">导入全部语料</button>
+        <button class="btn danger small" id="btn-rebuild">从已导入文档重建</button>
+      </div>
+      <select id="corpus-select" multiple size="4" style="min-height:92px"></select>
+      <div class="muted small mt">按住 Ctrl / Cmd 可多选。新增语料只增量追加节点证据，不覆盖其他文档已有关系。</div>
+    </section>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>本次抽取三元组</h2>
+        <div id="relation-preview" class="muted">尚未预览。</div>
+      </section>
+      <section class="card kg-detail" id="detail-panel">
+        <h2>节点 / 关系详情</h2>
+        <div class="muted">点击图中的节点或有向边，查看参与的原文句子、触发词、时间限定和来源文档。</div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">知识图谱</h2>
+        <select id="filter-type" style="width:130px"><option value="">全部类型</option></select>
+        <select id="filter-relation" style="width:140px"><option value="">全部关系</option></select>
+        <input type="text" id="filter-q" placeholder="搜索节点 / 别名" style="width:190px">
+        <button class="btn secondary small" id="btn-refresh-graph">刷新</button>
+      </div>
+      <div id="stats" class="muted small mb"></div>
+      <div class="kg-wrap">
+        <svg id="kg-svg" class="kg-svg">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#94a3b8"></path>
+            </marker>
+            <marker id="arrow-active" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#4f6ef7"></path>
+            </marker>
+          </defs>
+          <g id="kg-root"></g>
+        </svg>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("kg.html");
+
+let currentGraph = { nodes: [], edges: [] };
+let selectedNodeId = null, selectedEdgeId = null;
+const NODE_COLORS = {
+  PERSON: "#3b82f6", LOCATION: "#22c55e", ORGANIZATION: "#f59e0b",
+  DATE: "#6366f1", TIME: "#ec4899", MONEY: "#d97706", NUMBER: "#06b6d4",
+  PRODUCT: "#0f766e", CATEGORY: "#ca8a04", TITLE: "#c026d3", EVENT: "#ea580c",
+  PERCENT: "#8b5cf6",
+};
+
+function typeBadge(t) {
+  return `<span class="badge blue">${esc(ENTITY_NAMES[t] || t)}</span>`;
+}
+function relBadge(r) {
+  return `<span class="badge green">${esc(RELATION_NAMES[r] || r)}</span>`;
+}
+
+function renderPreview(data) {
+  const host = $("#relation-preview");
+  if (!data.relations.length) {
+    host.innerHTML = `<div class="muted">未从现有强模式中抽到关系；实体仍会保留为节点，但不会硬造边。</div>`;
+    return;
+  }
+  host.innerHTML = data.relations.map(r => `
+    <div class="kg-evidence kg-triple">
+      ${esc(r.source.text)} ──${relBadge(r.relation)}──▶ ${esc(r.target.text)}
+      ${r.qualifiers.time ? `<span class="badge amber">${esc(r.qualifiers.time.text)}</span>` : ""}
+      <div class="muted small mt">证据：${esc(r.evidence.sentence)}</div>
+    </div>`).join("");
+}
+
+async function previewRelations() {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  const btn = $("#btn-preview");
+  setLoading(btn, true, "抽取中…");
+  try {
+    renderPreview(await api("/api/relations", { method: "POST", body: { text } }));
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function ingestText() {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  const btn = $("#btn-ingest");
+  setLoading(btn, true, "导入中…");
+  try {
+    const r = await api("/api/kg/ingest", { method: "POST", body: { text, name: "手工文本" } });
+    renderPreview(r.extracted);
+    toast(`已合并：${r.relations} 条关系，${r.mentions} 条证据`);
+    await loadGraph();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function loadCorpora() {
+  const r = await api("/api/corpus");
+  $("#corpus-select").innerHTML = r.corpora.map(c =>
+    `<option value="${esc(c.id)}">${esc(c.name)} (${c.length} 字)</option>`).join("");
+}
+
+async function ingestCorpora(all = false) {
+  let ids = [];
+  if (all) ids = Array.from($("#corpus-select").options).map(o => o.value);
+  else ids = Array.from($("#corpus-select").selectedOptions).map(o => o.value);
+  if (!ids.length) return toast("请选择至少一篇语料", "err");
+  try {
+    const r = await api("/api/kg/ingest", { method: "POST", body: { corpus_ids: ids } });
+    toast(`已导入 ${r.documents} 篇文档`);
+    await loadGraph();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadGraph() {
+  const params = new URLSearchParams();
+  if ($("#filter-type").value) params.set("type", $("#filter-type").value);
+  if ($("#filter-relation").value) params.set("relation", $("#filter-relation").value);
+  if ($("#filter-q").value.trim()) params.set("q", $("#filter-q").value.trim());
+  const data = await api(`/api/kg?${params}`);
+  currentGraph = data;
+  updateFilters(data);
+  renderStats(data.stats);
+  renderGraph(data);
+}
+
+function renderStats(s) {
+  $("#stats").innerHTML =
+    `文档 ${s.documents} · 节点 ${s.nodes} · 有向边 ${s.edges}` +
+    Object.entries(s.node_types || {}).map(([k,v]) => ` · ${ENTITY_NAMES[k] || k} ${v}`).join("");
+}
+
+function layout(nodes, edges, width, height) {
+  if (!nodes.length) return {};
+  const index = new Map(nodes.map((n, i) => [n.id, i]));
+  nodes.forEach((n, i) => {
+    const angle = i * 2.39996;
+    n.x = width / 2 + Math.cos(angle) * Math.min(width, height) * .36 + (Math.random() - .5) * 18;
+    n.y = height / 2 + Math.sin(angle) * Math.min(width, height) * .36 + (Math.random() - .5) * 18;
+    n.vx = 0; n.vy = 0;
+  });
+  const links = edges.map(e => ({ s: index.get(e.source_id), t: index.get(e.target_id) }))
+                    .filter(l => l.s != null && l.t != null);
+  for (let iter = 0; iter < 360; iter++) {
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy || 0.01;
+        const force = 5200 / d2;
+        const d = Math.sqrt(d2);
+        a.vx += dx / d * force; a.vy += dy / d * force;
+        b.vx -= dx / d * force; b.vy -= dy / d * force;
+      }
+      a.vx += (width / 2 - a.x) * .006;
+      a.vy += (height / 2 - a.y) * .006;
+    }
+    links.forEach(l => {
+      const a = nodes[l.s], b = nodes[l.t];
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx*dx + dy*dy) || 1;
+      const target = 112, force = (d - target) * .025;
+      const fx = dx / d * force, fy = dy / d * force;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    });
+    nodes.forEach(n => {
+      n.vx *= .82; n.vy *= .82;
+      n.x = Math.max(40, Math.min(width - 40, n.x + n.vx));
+      n.y = Math.max(35, Math.min(height - 30, n.y + n.vy));
+    });
+  }
+}
+
+function renderGraph(data) {
+  const svg = $("#kg-svg");
+  const root = $("#kg-root");
+  const width = svg.clientWidth || 900, height = svg.clientHeight || 520;
+  layout(data.nodes, data.edges, width, height);
+  const byId = new Map(data.nodes.map(n => [n.id, n]));
+  root.innerHTML = `<g id="edges"></g><g id="edge-labels"></g><g id="nodes"></g>`;
+
+  const edgeGroup = $("#edges"), labelGroup = $("#edge-labels"), nodeGroup = $("#nodes");
+  data.edges.forEach(e => {
+    const s = byId.get(e.source_id), t = byId.get(e.target_id);
+    if (!s || !t) return;
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.dataset.edge = e.id;
+    g.classList.add("kg-edge-group");
+    const dx = t.x - s.x, dy = t.y - s.y, d = Math.sqrt(dx*dx + dy*dy) || 1;
+    const gap = 24;
+    const x2 = t.x - dx / d * gap, y2 = t.y - dy / d * gap;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M${s.x},${s.y} L${x2},${y2}`);
+    path.setAttribute("class", "kg-edge");
+    path.setAttribute("marker-end", "url(#arrow)");
+    path.style.cursor = "pointer";
+    path.addEventListener("click", () => showEdge(e.id));
+    g.appendChild(path);
+
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", (s.x + t.x) / 2);
+    label.setAttribute("y", (s.y + t.y) / 2 - 5);
+    label.setAttribute("text-anchor", "middle");
+    label.setAttribute("class", "kg-edge-label");
+    label.textContent = RELATION_NAMES[e.relation] || e.relation;
+    label.style.cursor = "pointer";
+    label.addEventListener("click", () => showEdge(e.id));
+    labelGroup.appendChild(label);
+  });
+
+  data.nodes.forEach(n => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("transform", `translate(${n.x},${n.y})`);
+    g.setAttribute("class", "kg-node");
+    g.dataset.id = n.id;
+    const r = Math.min(25, 10 + Math.sqrt(n.mention_count || 1) * 4);
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("r", r);
+    circle.setAttribute("fill", NODE_COLORS[n.type] || "#94a3b8");
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttribute("y", r + 14);
+    text.setAttribute("text-anchor", "middle");
+    text.textContent = n.name.length > 12 ? n.name.slice(0, 12) + "…" : n.name;
+    g.appendChild(circle); g.appendChild(text);
+    g.addEventListener("click", () => showNode(n.id));
+    nodeGroup.appendChild(g);
+  });
+  if (selectedNodeId) markNode(selectedNodeId);
+  if (selectedEdgeId) markEdge(selectedEdgeId);
+}
+
+function markNode(id) {
+  selectedNodeId = id; selectedEdgeId = null;
+  $$(".kg-node").forEach(g => g.classList.toggle("active", g.dataset.id === id));
+  $$(".kg-edge-group").forEach(g => g.classList.remove("active"));
+}
+function markEdge(id) {
+  selectedEdgeId = id; selectedNodeId = null;
+  $$(".kg-node").forEach(g => g.classList.remove("active"));
+  $$(".kg-edge-group").forEach(g => g.classList.toggle("active", g.dataset.edge === id));
+}
+
+async function showNode(id) {
+  markNode(id);
+  const data = await api(`/api/kg/nodes/${id}`);
+  const n = data.node;
+  const edgeNames = data.edges.map(e => {
+    const out = e.source_id === id;
+    const other = out ? e.target_name : e.source_name;
+    return `<div>${out ? "▶" : "◀"} ${esc(e.relation_name)} <strong>${esc(other)}</strong></div>`;
+  }).join("") || '<div class="muted">暂无关系边</div>';
+  const mentions = data.mentions.filter(m => m.kind === "node").map(m =>
+    `<div class="kg-evidence">${esc(m.sentence)}</div>`).join("") ||
+    '<div class="muted">暂无节点原文</div>';
+  $("#detail-panel").innerHTML = `
+    <h2>${esc(n.name)} ${typeBadge(n.type)}</h2>
+    <div class="muted small">规范名：${esc(n.canonical)} · 出现 ${n.mention_count} 次 · 涉及 ${n.doc_count} 篇文档</div>
+    <div class="mt"><strong>别名 / 原文写法：</strong>${(n.aliases || []).map(esc).join("、") || "—"}</div>
+    <h3 class="mt">参与的有向关系</h3>${edgeNames}
+    <h3 class="mt">原文句子</h3>${mentions}
+    <h3 class="mt">显式合并别名</h3>
+    <div class="row"><input type="text" id="alias-input" placeholder="输入该对象的另一个名称"><button class="btn small" id="btn-alias">合并</button></div>
+    <div class="muted small mt">只做人工确认的同名合并；系统不会根据字符串相似性自动猜测。</div>`;
+  $("#btn-alias").addEventListener("click", async () => {
+    const alias = $("#alias-input").value.trim();
+    if (!alias) return;
+    try { await api(`/api/kg/nodes/${id}/alias`, { method: "POST", body: { alias } }); toast("别名已合并"); await loadGraph(); showNode(id); }
+    catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function showEdge(id) {
+  markEdge(id);
+  const data = await api(`/api/kg/edges/${id}`);
+  const e = data.edge;
+  $("#detail-panel").innerHTML = `
+    <h2>关系证据</h2>
+    <div class="kg-triple" style="font-size:14px">
+      <strong>${esc(e.source_name)}</strong> ${relBadge(e.relation)} <strong>${esc(e.target_name)}</strong>
+    </div>
+    <div class="muted small mt">方向固定为源节点 → 目标节点 · ${e.doc_count} 篇文档 · ${e.mention_count} 条证据 · 置信度 ${e.confidence}</div>
+    ${e.qualifiers && e.qualifiers.all_times ? `<div class="mt">时间：${e.qualifiers.all_times.map(t => `<span class="badge amber">${esc(t.text || t)}</span>`).join(" ")}</div>` : ""}
+    <h3 class="mt">合并的原文句子</h3>
+    ${data.mentions.map(m => `<div class="kg-evidence"><div class="muted small">${esc(m.doc_name || m.doc_id)} · 触发词：${esc(m.trigger || "—")}</div>${esc(m.sentence)}</div>`).join("")}`;
+}
+
+function populateFilters(data) {
+  updateTypeOptions(data, new Set(data.nodes.map(n => n.type)));
+  updateRelationOptions(data, new Set(data.edges.map(e => e.relation)));
+}
+
+function updateFilters(data) {
+  updateTypeOptions(data, new Set(data.nodes.map(n => n.type)));
+  updateRelationOptions(data, new Set(data.edges.map(e => e.relation)));
+}
+
+function updateTypeOptions(data, types) {
+  const current = $("#filter-type").value;
+  $("#filter-type").innerHTML = `<option value="">全部类型</option>` +
+    [...types].sort().map(t => `<option value="${t}">${ENTITY_NAMES[t] || t}</option>`).join("");
+  $("#filter-type").value = current;
+}
+
+function updateRelationOptions(data, rels) {
+  const current = $("#filter-relation").value;
+  $("#filter-relation").innerHTML = `<option value="">全部关系</option>` +
+    [...rels].sort().map(r => `<option value="${r}">${RELATION_NAMES[r] || r}</option>`).join("");
+  $("#filter-relation").value = current;
+}
+
+$("#btn-preview").addEventListener("click", previewRelations);
+$("#btn-ingest").addEventListener("click", ingestText);
+$("#btn-load-corpora").addEventListener("click", loadCorpora);
+$("#btn-ingest-selected").addEventListener("click", () => ingestCorpora(false));
+$("#btn-ingest-all").addEventListener("click", () => ingestCorpora(true));
+$("#btn-rebuild").addEventListener("click", async () => {
+  if (!confirm("将从已保存文档重新生成节点、边和证据，确认？")) return;
+  await api("/api/kg/rebuild", { method: "POST" });
+  toast("图谱已重建");
+  await loadGraph();
+});
+$("#btn-refresh-graph").addEventListener("click", loadGraph);
+$("#filter-q").addEventListener("keydown", e => { if (e.key === "Enter") loadGraph(); });
+$("#filter-type").addEventListener("change", loadGraph);
+$("#filter-relation").addEventListener("change", loadGraph);
+
+(async function init() {
+  await loadCorpora();
+  const data = await api("/api/kg");
+  populateFilters(data);
+  renderStats(data.stats);
+  renderGraph(data);
+  previewRelations();
+})();
+</script>
+</body>
+</html>
