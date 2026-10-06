@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实体关系图谱 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">实体关系图谱</h1>
+    <p class="page-desc">以触发词为依据联合抽取实体与有向关系，跨文档对齐同一对象，
+      同一关系合并成一条边；点击节点查看它参与的原句证据。</p>
+
+    <section class="card">
+      <label>输入文本（可粘贴新闻、公告、介绍等）</label>
+      <textarea id="text">马云任职于阿里巴巴集团，2018年担任董事长。阿里巴巴集团总部位于杭州。2023年9月，华为在深圳发布了全新的Mate60手机，Mate60属于智能手机品类。腾讯向美团投资，特斯拉收购了SolarCity。</textarea>
+      <div class="toolbar mt">
+        <button class="btn" id="btn-extract">仅预览抽取</button>
+        <button class="btn secondary" id="btn-ingest">抽取并入图谱</button>
+        <select id="corpus-select" style="max-width:220px"></select>
+        <button class="btn secondary" id="btn-ingest-corpus">把选中语料入库</button>
+        <button class="btn secondary" id="btn-ingest-all">全部语料入库</button>
+      </div>
+    </section>
+
+    <div class="grid cols-2" id="preview-grid" style="display:none">
+      <section class="card">
+        <h2>实体（<span id="pe-count">0</span>）</h2>
+        <div id="pe-entities" class="small" style="line-height:2.2"></div>
+      </section>
+      <section class="card">
+        <h2>关系（<span id="pr-count">0</span>）</h2>
+        <div id="pe-relations" class="list"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">知识图谱</h2>
+        <div class="kg-stats" id="kg-stats"></div>
+      </div>
+
+      <div class="toolbar">
+        <span class="muted small">关系筛选：</span>
+        <div id="rel-filters" class="small" style="display:flex;flex-wrap:wrap;gap:10px"></div>
+        <button class="btn secondary small" id="btn-rel-all">全选</button>
+        <button class="btn secondary small" id="btn-rel-none">全不选</button>
+        <span style="flex:1"></span>
+        <button class="btn secondary small" id="btn-refresh">刷新图谱</button>
+      </div>
+
+      <div class="kg-layout">
+        <div>
+          <svg id="kg-canvas" viewBox="0 0 900 600" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3"
+                      orient="auto" markerUnits="strokeWidth">
+                <path d="M0,0 L0,6 L9,3 z" fill="#94a3b8"></path>
+              </marker>
+              <marker id="arrow-hi" markerWidth="10" markerHeight="10" refX="9" refY="3"
+                      orient="auto" markerUnits="strokeWidth">
+                <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"></path>
+              </marker>
+            </defs>
+            <g id="kg-viewport">
+              <g id="kg-links"></g>
+              <g id="kg-link-labels"></g>
+              <g id="kg-nodes"></g>
+            </g>
+          </svg>
+          <p class="muted small mt">拖拽节点可调整布局；滚轮缩放、空白处拖动平移；点击节点查看原文证据。</p>
+        </div>
+
+        <div class="kg-side">
+          <section class="card" style="margin-bottom:16px">
+            <h2>节点详情 <button class="btn secondary small" id="btn-clear-sel"
+                    style="display:none">取消选择</button></h2>
+            <div id="node-detail" class="muted small">点击图中的节点，查看它参与的全部原句与关系。</div>
+          </section>
+          <section class="card">
+            <h2>已入库文档 <span id="doc-count" class="muted small"></span></h2>
+            <div id="doc-list" class="list"></div>
+          </section>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("kg.html");
+
+let REL_SCHEMA = [];
+let lastExtraction = null;
+let graph = { nodes: [], links: [] };
+let selectedKey = null;
+let activeRelations = new Set();
+
+/* ---------- 预览抽取 ---------- */
+async function doExtract(persist) {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  const btn = persist ? $("#btn-ingest") : $("#btn-extract");
+  setLoading(btn, true, persist ? "入库中…" : "抽取中…");
+  try {
+    if (persist) {
+      const r = await api("/api/kg/ingest", { method: "POST", body: { text } });
+      lastExtraction = r.extraction;
+      toast(`已入库：${r.nodes} 个节点、${r.edges} 条边`);
+    } else {
+      lastExtraction = await api("/api/kg/extract", { method: "POST", body: { text } });
+    }
+    renderPreview();
+    await loadGraph();
+    await loadDocs();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function renderPreview() {
+  const ex = lastExtraction;
+  $("#preview-grid").style.display = "grid";
+  const ents = ex.entities || [];
+  $("#pe-count").textContent = ents.length;
+  $("#pe-entities").innerHTML = ents.map(e =>
+    `<span class="badge blue" style="margin:2px"><span class="ent-${e.type}" style="padding:0 4px;border-radius:3px">${esc(e.text)}</span> ${ENTITY_NAMES[e.type] || e.type}</span>`
+  ).join(" ") || '<span class="muted">无实体</span>';
+
+  const rels = ex.relations || [];
+  $("#pr-count").textContent = rels.length;
+  $("#pe-relations").innerHTML = rels.map(r => `
+    <div class="list-item" style="padding:8px 10px">
+      <div class="meta">
+        <div class="name">
+          <span class="ent-${r.head.type}" style="padding:0 4px;border-radius:3px">${esc(r.head.text)}</span>
+          <span class="muted small"> —${esc(r.relation_name)}→ </span>
+          <span class="ent-${r.tail.type}" style="padding:0 4px;border-radius:3px">${esc(r.tail.text)}</span>
+        </div>
+        <div class="sub">触发词「${esc(r.action || "—")}」· 置信度 ${r.confidence}
+          ${(r.qualifiers || []).length ? "· 限定：" + r.qualifiers.map(q => esc(q.text)).join("、") : ""}</div>
+      </div>
+    </div>`).join("") || '<div class="muted small">本句未抽取到关系（不硬造）。</div>';
+}
+
+/* ---------- 图谱加载与筛选 ---------- */
+async function loadGraph() {
+  const params = activeRelations.size
+    ? "?relations=" + [...activeRelations].join(",") : "";
+  graph = await api("/api/kg/graph" + params);
+  renderStats();
+  renderRelationFilters();
+  renderGraph();
+  if (selectedKey) renderNodeDetail(selectedKey);
+}
+
+function renderStats() {
+  const types = {};
+  graph.nodes.forEach(n => types[n.type] = (types[n.type] || 0) + 1);
+  const typeStr = Object.entries(types).map(([t, c]) =>
+    `<span style="color:${TYPE_COLORS[t]}">${ENTITY_NAMES[t] || t} ${c}</span>`).join(" · ");
+  $("#kg-stats").innerHTML =
+    `<span class="kg-stat">节点<b>${graph.nodes.length}</b></span>
+     <span class="kg-stat">关系边<b>${graph.links.length}</b></span>
+     <span class="kg-stat">${typeStr}</span>`;
+}
+
+async function renderRelationFilters() {
+  if (!REL_SCHEMA.length) {
+    const meta = await api("/api/meta");
+    REL_SCHEMA = meta.relation_schema || [];
+    if (!activeRelations.size)
+      activeRelations = new Set(REL_SCHEMA.map(r => r.id));
+  }
+  const present = new Set(graph.links.map(l => l.relation));
+  $("#rel-filters").innerHTML = REL_SCHEMA.filter(r => present.has(r.id)).map(r =>
+    `<label class="chip-filter"><input type="checkbox" value="${r.id}"
+        ${activeRelations.has(r.id) ? "checked" : ""}> ${r.name}</label>`).join("");
+  $$("#rel-filters input").forEach(cb => cb.addEventListener("change", () => {
+    if (cb.checked) activeRelations.add(cb.value);
+    else activeRelations.delete(cb.value);
+    loadGraph();
+  }));
+}
+
+/* ---------- SVG 力导向图 ---------- */
+const sim = { nodes: [], links: [], raf: null };
+
+function renderGraph() {
+  const W = 900, H = 600;
+  const byKey = {};
+  sim.nodes = graph.nodes.map((n, i) => {
+    const angle = (i / Math.max(1, graph.nodes.length)) * Math.PI * 2;
+    const v = {
+      ...n, x: W / 2 + Math.cos(angle) * 220, y: H / 2 + Math.sin(angle) * 220,
+      vx: 0, vy: 0,
+    };
+    byKey[n.key] = v;
+    return v;
+  });
+  sim.links = graph.links.map(l => ({ ...l, s: byKey[l.source], t: byKey[l.target] }))
+    .filter(l => l.s && l.t);
+
+  const svg = $("#kg-canvas");
+  const gLinks = $("#kg-links");
+  const gLabels = $("#kg-link-labels");
+  const gNodes = $("#kg-nodes");
+  gLinks.innerHTML = ""; gLabels.innerHTML = ""; gNodes.innerHTML = "";
+
+  sim.links.forEach(l => {
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("class", "kg-link");
+    p.setAttribute("marker-end", "url(#arrow)");
+    p.dataset.key = l.key;
+    gLinks.appendChild(p);
+    l.el = p;
+
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    t.setAttribute("class", "kg-link-label");
+    t.textContent = l.relation_name + (l.action ? `·${l.action}` : "");
+    gLabels.appendChild(t);
+    l.labelEl = t;
+  });
+
+  sim.nodes.forEach(n => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("class", "kg-node");
+    g.dataset.key = n.key;
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    const r = 9 + Math.min(10, Math.sqrt(n.mention_count) * 2.5);
+    c.setAttribute("r", r);
+    c.setAttribute("fill", TYPE_COLORS[n.type] || "#94a3b8");
+    g.appendChild(c);
+    const tx = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    tx.setAttribute("y", -r - 6);
+    tx.textContent = n.name.length > 8 ? n.name.slice(0, 8) + "…" : n.name;
+    g.appendChild(tx);
+    g.addEventListener("click", (e) => { e.stopPropagation(); selectNode(n.key); });
+    makeDraggable(g, n);
+    gNodes.appendChild(g);
+    n.el = g;
+  });
+
+  startSimulation(W, H);
+  svg.onclick = () => selectNode(null);
+}
+
+function startSimulation(W, H) {
+  cancelAnimationFrame(sim.raf);
+  let ticks = 0;
+  function tick() {
+    const ns = sim.nodes, ls = sim.links;
+    // 斥力
+    for (let i = 0; i < ns.length; i++) {
+      for (let j = i + 1; j < ns.length; j++) {
+        let dx = ns[i].x - ns[j].x, dy = ns[i].y - ns[j].y;
+        let d2 = dx * dx + dy * dy + 0.01;
+        const d = Math.sqrt(d2);
+        const force = 2600 / d2;
+        const fx = dx / d * force, fy = dy / d * force;
+        ns[i].vx += fx; ns[i].vy += fy;
+        ns[j].vx -= fx; ns[j].vy -= fy;
+      }
+    }
+    // 弹簧
+    ls.forEach(l => {
+      let dx = l.t.x - l.s.x, dy = l.t.y - l.s.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const target = 130;
+      const f = (d - target) * 0.02;
+      const fx = dx / d * f, fy = dy / d * f;
+      l.s.vx += fx; l.s.vy += fy;
+      l.t.vx -= fx; l.t.vy -= fy;
+    });
+    // 向心力 + 阻尼
+    ns.forEach(n => {
+      if (n.fixed) { n.vx = 0; n.vy = 0; return; }
+      n.vx += (W / 2 - n.x) * 0.003;
+      n.vy += (H / 2 - n.y) * 0.003;
+      n.vx *= 0.85; n.vy *= 0.85;
+      n.x += Math.max(-8, Math.min(8, n.vx));
+      n.y += Math.max(-8, Math.min(8, n.vy));
+      n.x = Math.max(20, Math.min(W - 20, n.x));
+      n.y = Math.max(20, Math.min(H - 20, n.y));
+    });
+    drawLinks();
+    ticks++;
+    if (ticks < 400) sim.raf = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+function drawLinks() {
+  sim.links.forEach(l => {
+    const x1 = l.s.x, y1 = l.s.y, x2 = l.t.x, y2 = l.t.y;
+    // 留出节点半径
+    const dx = x2 - x1, dy = y2 - y1;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const r2 = 16;
+    const ux = dx / d, uy = dy / d;
+    const ex = x2 - ux * r2, ey = y2 - uy * r2;
+    const mx = (x1 + ex) / 2, my = (y1 + ey) / 2;
+    l.el.setAttribute("d", `M${x1},${y1} L${ex},${ey}`);
+    l.labelEl.setAttribute("x", mx);
+    l.labelEl.setAttribute("y", my - 4);
+    l.s.el.setAttribute("transform", `translate(${l.s.x},${l.s.y})`);
+    l.t.el.setAttribute("transform", `translate(${l.t.x},${l.t.y})`);
+  });
+}
+
+function makeDraggable(el, node) {
+  const svg = $("#kg-canvas");
+  let dragging = false;
+  function toSvg(ev) {
+    const pt = svg.createSVGPoint();
+    pt.x = ev.clientX; pt.y = ev.clientY;
+    const p = pt.matrixTransform($("#kg-viewport").getScreenCTM().inverse());
+    return p;
+  }
+  el.addEventListener("mousedown", (ev) => {
+    dragging = true; node.fixed = true; ev.stopPropagation();
+    function move(e2) {
+      if (!dragging) return;
+      const p = toSvg(e2); node.x = p.x; node.y = p.y;
+      node.vx = 0; node.vy = 0; drawLinks();
+    }
+    function up() {
+      dragging = false;
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      setTimeout(() => { node.fixed = false; }, 600);
+    }
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  });
+}
+
+// 滚轮缩放 + 背景拖动平移
+(function setupPanZoom() {
+  const svg = $("#kg-canvas"), vp = $("#kg-viewport");
+  let scale = 1, tx = 0, ty = 0;
+  function apply() {
+    vp.setAttribute("transform", `translate(${tx},${ty}) scale(${scale})`);
+  }
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.92 : 1.08;
+    scale = Math.max(0.4, Math.min(2.5, scale * delta));
+    apply();
+  }, { passive: false });
+  let panning = false, sx = 0, sy = 0;
+  svg.addEventListener("mousedown", (e) => {
+    if (e.target.closest(".kg-node")) return;
+    panning = true; sx = e.clientX - tx; sy = e.clientY - ty;
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!panning) return;
+    tx = e.clientX - sx; ty = e.clientY - sy; apply();
+  });
+  window.addEventListener("mouseup", () => panning = false);
+})();
+
+/* ---------- 节点选择与高亮 ---------- */
+function selectNode(key) {
+  selectedKey = key;
+  $$("#kg-nodes .kg-node").forEach(el => {
+    el.classList.toggle("selected", el.dataset.key === key);
+  });
+  if (!key) {
+    $$(".kg-link,.kg-link-label").forEach(el => {
+      el.classList.remove("highlight", "dimmed");
+    });
+    $$(".kg-node").forEach(el => el.classList.remove("dimmed"));
+    $("#node-detail").className = "muted small";
+    $("#node-detail").textContent = "点击图中的节点，查看它参与的全部原句与关系。";
+    $("#btn-clear-sel").style.display = "none";
+    return;
+  }
+  const neighbor = new Set([key]);
+  $$(".kg-link").forEach(el => {
+    const link = sim.links.find(l => l.key === el.dataset.key);
+    if (!link) return;
+    const hit = link.source === key || link.target === key;
+    el.classList.toggle("highlight", hit);
+    el.classList.toggle("dimmed", !hit);
+    link.labelEl.classList.toggle("dimmed", !hit);
+    if (hit) { neighbor.add(link.source); neighbor.add(link.target); }
+  });
+  $$(".kg-node").forEach(el =>
+    el.classList.toggle("dimmed", !neighbor.has(el.dataset.key)));
+  $("#btn-clear-sel").style.display = "";
+  renderNodeDetail(key);
+}
+
+async function renderNodeDetail(key) {
+  const el = $("#node-detail");
+  el.className = "small";
+  el.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api("/api/kg/nodes/" + key);
+    const aliases = (d.aliases || []).map(a =>
+      `<span class="badge blue">${esc(a)}</span>`).join("");
+    el.innerHTML = `
+      <div style="font-size:15px;font-weight:700">
+        <span class="ent-${d.type}" style="padding:1px 6px;border-radius:4px">${esc(d.name)}</span>
+        <span class="muted small">${ENTITY_NAMES[d.type] || d.type}</span>
+      </div>
+      <div class="muted" style="margin:6px 0">提及 ${d.mention_count} 次 · 出现在 ${d.doc_ids.length} 篇文档</div>
+      ${aliases ? `<div class="alias-list mt"><div class="muted">别名 / 写法：</div>${aliases}</div>` : ""}
+      <div class="mt"><b>参与原句（${d.sentences.length}）</b></div>
+      <div class="mt">${d.sentences.map(s => `
+        <div class="evidence-item">
+          <div class="ev-meta">${esc(s.doc_name || s.doc_id)} · 文档 ${esc(s.doc_id)}</div>
+          <div>${highlightEntities(s.sentence, extractSentenceEnts(s))}</div>
+          <div>${s.relations.map(r =>
+            `<span class="ev-rel ${r.direction === 'in' ? 'in' : ''}">
+              ${r.direction === 'in' ? '← ' : '→ '}${esc(r.relation_name)}${r.action ? '·' + esc(r.action) : ''} ${esc(r.other)}</span>`
+          ).join("")}</div>
+        </div>`).join("") || '<span class="muted">暂无原句证据</span>'}</div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+// 从节点详情的原句里提取实体位置用于高亮（证据保存了 head/tail 偏移）
+function extractSentenceEnts(s) {
+  const out = [];
+  // s.relations 不含偏移；直接按文本匹配实体名做朴素高亮
+  s.relations.forEach(r => {
+    [r.other].forEach(name => {
+      if (!name) return;
+      let i = s.sentence.indexOf(name);
+      if (i >= 0) out.push({ text: name, start: i, end: i + name.length,
+                            type: guessTypeByName(name) });
+    });
+  });
+  // 高亮节点自身
+  const selfName = selectedKey ? (sim.nodes.find(n => n.key === selectedKey) || {}).name : "";
+  if (selfName) {
+    let i = s.sentence.indexOf(selfName);
+    if (i >= 0) out.push({ text: selfName, start: i, end: i + selfName.length,
+                          type: (sim.nodes.find(n => n.key === selectedKey) || {}).type });
+  }
+  return out;
+}
+function guessTypeByName(name) {
+  const n = sim.nodes.find(x => x.name === name);
+  return n ? n.type : "ORGANIZATION";
+}
+
+/* ---------- 文档列表 ---------- */
+async function loadDocs() {
+  const r = await api("/api/kg/docs");
+  $("#doc-count").textContent = `(${r.docs.length})`;
+  $("#doc-list").innerHTML = r.docs.map(d => `
+    <div class="list-item" style="padding:8px 10px">
+      <div class="meta">
+        <div class="name" style="font-size:13px">${esc(d.name)}</div>
+        <div class="sub">${d.node_count} 节点 · ${d.edge_count} 边 · ${fmtTime(d.ingested_at)}</div>
+      </div>
+      <button class="btn danger small" data-doc="${esc(d.doc_id)}">移除</button>
+    </div>`).join("") || '<span class="muted small">暂无文档</span>';
+  $$("#doc-list button").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("从图谱移除该文档？仅移除它独有的证据与节点。")) return;
+    try {
+      await api("/api/kg/docs/" + encodeURIComponent(b.dataset.doc) + "/remove",
+                { method: "POST" });
+      toast("已移除");
+      await loadGraph(); await loadDocs();
+    } catch (e) { toast(e.message, "err"); }
+  }));
+}
+
+/* ---------- 语料入库 ---------- */
+async function loadCorpusOptions() {
+  const r = await api("/api/corpus");
+  const sel = $("#corpus-select");
+  sel.innerHTML = r.corpora.map(c =>
+    `<option value="${esc(c.id)}">${esc(c.name)}（${c.length}字）</option>`).join("");
+}
+async function ingestCorpus(ids) {
+  const body = { corpus_ids: ids };
+  const btn = ids ? $("#btn-ingest-corpus") : $("#btn-ingest-all");
+  setLoading(btn, true, "入库中…");
+  try {
+    const r = await api("/api/kg/ingest", { method: "POST", body });
+    toast(`已入库 ${r.ingested.length} 篇，共 ${r.total_nodes} 节点 / ${r.total_edges} 边`);
+    await loadGraph(); await loadDocs();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+/* ---------- 事件绑定 ---------- */
+$("#btn-extract").addEventListener("click", () => doExtract(false));
+$("#btn-ingest").addEventListener("click", () => doExtract(true));
+$("#btn-ingest-corpus").addEventListener("click", () => {
+  const v = $("#corpus-select").value;
+  if (v) ingestCorpus([v]);
+});
+$("#btn-ingest-all").addEventListener("click", () => ingestCorpus(null));
+$("#btn-refresh").addEventListener("click", loadGraph);
+$("#btn-rel-all").addEventListener("click", () => {
+  activeRelations = new Set(REL_SCHEMA.map(r => r.id)); loadGraph();
+});
+$("#btn-rel-none").addEventListener("click", () => {
+  activeRelations = new Set(); loadGraph();
+});
+$("#btn-clear-sel").addEventListener("click", () => selectNode(null));
+
+(async function init() {
+  await loadCorpusOptions();
+  await loadGraph();
+  await loadDocs();
+})();
+</script>
+</body>
+</html>

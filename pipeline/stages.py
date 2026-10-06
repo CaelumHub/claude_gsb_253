@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_relation_extractor)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -70,6 +70,11 @@ def _parse(ctx, params):
     return {"parse": {"dependency": dep, "constituency": const}}
 
 
+def _kg(ctx, params):
+    text = ctx.get("clean_text") or ctx.get("text", "")
+    return {"kg": get_relation_extractor().extract(text)}
+
+
 BUILTIN_STAGES = [
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
@@ -89,4 +94,6 @@ BUILTIN_STAGES = [
           description="机器翻译（模拟）", params={"direction": "zh2en"}),
     Stage("parse", _parse, inputs=["text", "clean_text"], outputs=["parse"],
           description="句法分析"),
+    Stage("kg_extract", _kg, inputs=["text", "clean_text"], outputs=["kg"],
+          description="实体关系联合抽取（知识图谱）"),
 ]

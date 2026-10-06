@@ -153,6 +153,67 @@ class ShardedStore:
             self._write_meta(meta)
             return record_id
 
+    def upsert(self, record: dict, key: str) -> str:
+        """按唯一键幂等写入：同键记录整体替换，否则插入。
+
+        供知识图谱等需要稳定身份（节点 id / 边 id）的场景使用。
+        返回记录 id；``record[key]`` 必须非空。
+        """
+        key_value = record.get(key)
+        if key_value in (None, ""):
+            raise ValueError(f"upsert 记录必须包含非空的键 {key!r}")
+        record = dict(record)
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            target: Optional[tuple[int, int, dict]] = None
+            for index in range(meta.get("shard_count", 0)):
+                records = self._read_shard(index)
+                for pos, existing in enumerate(records):
+                    if existing.get(key) == key_value \
+                            and not existing.get("_deleted"):
+                        target = (index, pos, existing)
+                        break
+                if target is not None:
+                    break
+
+            now = time.time()
+            if target is not None:
+                index, pos, old = target
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    record["id"] = old.get("id") or f"{self.task}_{key_value}"
+                    record["_created"] = old.get("_created", now)
+                    record["_updated"] = now
+                    records[pos] = record
+                    self._write_shard(index, records)
+                self._write_meta(meta)
+                return record["id"]
+
+            record_id = record.get("id") or f"{self.task}_{meta['next_id']}"
+            meta["next_id"] += 1
+            record["id"] = record_id
+            record.setdefault("_created", now)
+
+            index = meta["shard_count"] - 1 if meta["shard_count"] else -1
+            if index < 0:
+                index = 0
+                meta["shard_count"] = 1
+                self._write_shard(index, [record])
+            else:
+                with FileLock(lock_path_for(self._shard_path(index))):
+                    records = self._read_shard(index)
+                    if len(records) >= self.shard_size:
+                        index += 1
+                        meta["shard_count"] = index + 1
+                        records = [record]
+                    else:
+                        records = records + [record]
+                    self._write_shard(index, records)
+            meta["total"] = meta["total"] + 1
+            self._write_meta(meta)
+            return record_id
+
     def insert_many(self, records: Iterable[dict]) -> list[str]:
         """批量插入（事务式：要么全部成功，要么抛出）。"""
         ids: list[str] = []

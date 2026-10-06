@@ -16,10 +16,13 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_tagger, get_translator, get_relation_extractor,
+                 TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES,
+                 RELATION_SCHEMA, RELATION_NAMES)
+from nlp.ner import ENTITY_TYPE_NAMES
+from nlp.relation import ENTITY_TYPE_NAMES as KG_ENTITY_NAMES
 from nlp.lexicon import STOPWORDS
-from storage import StoreRegistry
+from storage import StoreRegistry, KnowledgeGraph
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -35,6 +38,10 @@ def _registry() -> StoreRegistry:
 
 def _engine():
     return current_app.config["PIPELINE_ENGINE"]
+
+
+def _kg() -> KnowledgeGraph:
+    return current_app.config["KNOWLEDGE_GRAPH"]
 
 
 def _models_dir() -> str:
@@ -105,12 +112,18 @@ def status():
 @api.get("/meta")
 def meta():
     """给前端提供标签集合与可配置参数。"""
+    entity_names = dict(ENTITY_TYPE_NAMES)
+    entity_names.update(KG_ENTITY_NAMES)
+    relations = [{"id": k, "name": v[0], "reverse": v[1],
+                  "head": v[2], "tail": v[3]}
+                 for k, v in RELATION_SCHEMA.items()]
     return jsonify({
         "tag_names": TAG_NAMES,
         "dep_rel_names": DEP_REL_NAMES,
         "phrase_names": PHRASE_NAMES,
-        "entity_type_names": ENTITY_TYPE_NAMES,
+        "entity_type_names": entity_names,
         "polarity_names": POLARITY_NAMES,
+        "relation_schema": relations,
         "directions": [{"id": "zh2en", "name": "中文 → 英文"},
                        {"id": "en2zh", "name": "英文 → 中文"}],
     })
@@ -287,6 +300,104 @@ def ner_annotate():
 def ner_annotations():
     records = _registry().task("annotation").all()
     return jsonify({"annotations": records})
+
+
+# ---------------------------------------------------------------------------
+# 知识图谱：实体关系联合抽取 + 跨文档对齐
+# ---------------------------------------------------------------------------
+
+@api.post("/kg/extract")
+def kg_extract():
+    """对单条文本做实体关系联合抽取（不落库，用于预览）。"""
+    data = _payload()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    result = get_relation_extractor().extract(text)
+    return jsonify(result)
+
+
+@api.post("/kg/ingest")
+def kg_ingest():
+    """抽取文本/语料并入图谱。幂等：相同 doc_id 重复入库会替换旧贡献。"""
+    data = _payload()
+    kg = _kg()
+
+    corpus_ids = data.get("corpus_ids")
+    if corpus_ids:
+        store = _registry().task("corpus")
+        targets = [(c, store.get(c)) for c in corpus_ids]
+        targets = [(cid, rec) for cid, rec in targets if rec]
+        if not targets:
+            return jsonify({"error": "所选语料不存在"}), 404
+        totals = {"nodes": 0, "edges": 0}
+        ingested = []
+        for cid, rec in targets:
+            extraction = get_relation_extractor().extract(rec.get("text", ""))
+            stat = kg.ingest(extraction, doc_id=cid,
+                             doc_name=rec.get("name", cid),
+                             text=rec.get("text", ""))
+            totals["nodes"] = stat["nodes"]
+            totals["edges"] = stat["edges"]
+            ingested.append({"doc_id": cid, "name": rec.get("name", cid),
+                             "nodes": stat["nodes"], "edges": stat["edges"]})
+        return jsonify({"ok": True, "ingested": ingested,
+                        "total_nodes": kg.stats()["nodes"],
+                        "total_edges": kg.stats()["edges"]})
+
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    doc_id = cid or data.get("doc_id") or f"adhoc_{uuid.uuid4().hex[:10]}"
+    name = data.get("name") or (doc_id if not cid else doc_id)
+    extraction = get_relation_extractor().extract(text)
+    stat = kg.ingest(extraction, doc_id=doc_id, doc_name=name, text=text)
+    return jsonify({"ok": True, "extraction": extraction, **stat})
+
+
+@api.get("/kg/graph")
+def kg_graph():
+    """返回画图用的 nodes/links，支持按关系类型/文档过滤。"""
+    relation_types = request.args.get("relations")
+    doc_ids = request.args.get("doc_ids")
+    limit = request.args.get("limit", default=400, type=int)
+    view = _kg().graph_view(
+        relation_types=relation_types.split(",") if relation_types else None,
+        doc_ids=doc_ids.split(",") if doc_ids else None,
+        limit=limit)
+    return jsonify(view)
+
+
+@api.get("/kg/stats")
+def kg_stats():
+    return jsonify(_kg().stats())
+
+
+@api.get("/kg/nodes/<key>")
+def kg_node_detail(key: str):
+    detail = _kg().node_detail(key)
+    if not detail:
+        return jsonify({"error": "节点不存在"}), 404
+    return jsonify(detail)
+
+
+@api.get("/kg/edges")
+def kg_edges():
+    relation = request.args.get("relation")
+    return jsonify({"edges": _kg().list_edges(relation)})
+
+
+@api.get("/kg/docs")
+def kg_docs():
+    return jsonify({"docs": _kg().list_docs()})
+
+
+@api.post("/kg/docs/<doc_id>/remove")
+def kg_remove_doc(doc_id: str):
+    ok = _kg().remove_doc(doc_id)
+    if not ok:
+        return jsonify({"error": "文档未入库"}), 404
+    return jsonify({"ok": True, "stats": _kg().stats()})
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +686,8 @@ def list_result_tasks():
     registry = _registry()
     tasks = []
     for name in registry.tasks():
-        if name in ("corpus", "pipeline_config", "annotation"):
+        if name in ("corpus", "pipeline_config", "annotation",
+                    "kg_node", "kg_edge", "kg_doc"):
             continue
         stats = registry.task(name).stats()
         tasks.append(stats)
